@@ -10,39 +10,38 @@ TARGET="${2:-}"
 shift $(( $# > 0 ? 1 : 0 )) || true
 shift $(( $# > 0 ? 1 : 0 )) || true
 
-PPANEL_ROOT="${PPANEL_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
-FRONTEND_ROOT="${FRONTEND_ROOT:-$PPANEL_ROOT/ppanel-frontend}"
-SERVER_ROOT="${SERVER_ROOT:-$PPANEL_ROOT/ppanel-server}"
+PPANEL_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+FRONTEND_ROOT="$PPANEL_ROOT/ppanel-frontend"
+SERVER_ROOT="$PPANEL_ROOT/ppanel-server"
 
-STATE_DIR="${STATE_DIR:-$HOME/.cache/ppanel-local-dev}"
+STATE_DIR="$HOME/.cache/ppanel-local-dev"
 SERVER_PID_FILE="$STATE_DIR/server.pid"
 FRONTEND_PID_FILE="$STATE_DIR/frontend.pid"
 SERVER_LOG_FILE="$STATE_DIR/server.log"
 FRONTEND_LOG_FILE="$STATE_DIR/frontend.log"
-DEV_NETWORK="${DEV_NETWORK:-ppanel-local-dev}"
-SERVER_CONTAINER="${SERVER_CONTAINER:-ppanel-local-server}"
-SERVER_IMAGE="${SERVER_IMAGE:-ppanel-server-ppanel}"
+DEV_NETWORK="ppanel-local-dev"
+SERVER_CONTAINER="ppanel-local-server"
+SERVER_IMAGE="ppanel-server-ppanel"
 
-FRONTEND_APP="${FRONTEND_APP:-user}"
-LOCAL_SERVER_HOST="${LOCAL_SERVER_HOST:-127.0.0.1}"
-LOCAL_SERVER_PORT="${LOCAL_SERVER_PORT:-8080}"
-LOCAL_FRONTEND_HOST="${LOCAL_FRONTEND_HOST:-127.0.0.1}"
-LOCAL_USER_PORT="${LOCAL_USER_PORT:-3000}"
-LOCAL_ADMIN_PORT="${LOCAL_ADMIN_PORT:-3001}"
+FRONTEND_APP="user"
+LOCAL_SERVER_HOST="127.0.0.1"
+LOCAL_SERVER_PORT="8080"
+LOCAL_FRONTEND_HOST="127.0.0.1"
+LOCAL_USER_PORT="3000"
+LOCAL_ADMIN_PORT="3001"
+REMOTE_MYSQL_HOST="host.docker.internal"
+REMOTE_REDIS_HOST="host.docker.internal"
+K8S_NAMESPACE="ppanel-dev"
+TELEPRESENCE_MANAGER_NAMESPACE="ppanel-dev"
+INSTALL_TRAFFIC_MANAGER="false"
 
-MYSQL_CONTAINER="${MYSQL_CONTAINER:-ppanel-local-mysql}"
-MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4.5}"
-MYSQL_PORT="${MYSQL_PORT:-13306}"
-MYSQL_DATABASE="${MYSQL_DATABASE:-ppanel_dev}"
-MYSQL_USER="${MYSQL_USER:-ppanel_dev}"
-MYSQL_PASSWORD="${MYSQL_PASSWORD:-ppanel-dev-password}"
-MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-dev-root-password}"
-SERVER_DB_USER="${SERVER_DB_USER:-root}"
-SERVER_DB_PASSWORD="${SERVER_DB_PASSWORD:-$MYSQL_ROOT_PASSWORD}"
+MYSQL_PORT="13306"
+MYSQL_DATABASE="ppanel_dev"
+SERVER_DB_USER="root"
+SERVER_DB_PASSWORD="dev-root-password"
 
-REDIS_CONTAINER="${REDIS_CONTAINER:-ppanel-local-redis}"
-REDIS_IMAGE="${REDIS_IMAGE:-redis:7.4.2}"
-REDIS_PORT="${REDIS_PORT:-16379}"
+REDIS_PORT="16379"
+REDIS_PASSWORD=""
 
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@ppanel.dev}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-password}"
@@ -60,29 +59,43 @@ CONFIG_PATH="$SERVER_ROOT/etc/ppanel.yaml"
 usage() {
   cat <<EOF
 Usage:
-  $SCRIPT_NAME up frontend [--frontend admin|user]
-  $SCRIPT_NAME up server
-  $SCRIPT_NAME up both [--frontend admin|user]
-  $SCRIPT_NAME test-auth
+  $SCRIPT_NAME up frontend [--frontend admin|user] [telepresence options]
+  $SCRIPT_NAME up server [shared dependency options] [telepresence options]
+  $SCRIPT_NAME up both [--frontend admin|user] [shared dependency options] [telepresence options]
+  $SCRIPT_NAME test-auth [shared dependency options]
   $SCRIPT_NAME status
   $SCRIPT_NAME leave [frontend|server|both]
   $SCRIPT_NAME help
 
 What this script does now:
-  - Starts local MySQL and Redis in Docker
-  - Starts local ppanel-server from source
-  - Initializes the backend automatically if needed
-  - Enables Google + Telegram auth methods automatically
-  - Runs OAuth redirect self-checks
-  - Starts the local frontend dev server when requested
+  - up frontend: starts/reuses a local frontend and intercepts frontend traffic with Telepresence
+  - up server: starts a local backend and intercepts API traffic with Telepresence
+  - up both: intercepts both frontend + backend traffic with Telepresence
+  - Always uses shared MySQL/Redis for the local backend
+  - Initializes the backend automatically if needed and runs OAuth redirect self-checks
 
-Helpful env vars:
+Shared dependency options:
+  --mysql-host HOST
+  --mysql-port PORT
+  --mysql-database NAME
+  --mysql-user USER
+  --mysql-password PASSWORD
+  --redis-host HOST
+  --redis-port PORT
+  --redis-password PASSWORD
+  Defaults: host.docker.internal:13306 for MySQL, host.docker.internal:16379 for Redis
+
+Telepresence options:
+  --namespace NS
+  --manager-namespace NS
+  --install-traffic-manager
+  Defaults: namespace=ppanel-dev, manager-namespace=ppanel-dev
+
+Still configurable via env vars:
   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
   TELEGRAM_BOT_TOKEN
   ADMIN_EMAIL / ADMIN_PASSWORD
   VITE_ALLOWED_HOSTS / VITE_DEVTOOLS_PORT
-  LOCAL_SERVER_PORT / LOCAL_USER_PORT / LOCAL_ADMIN_PORT
-  PPANEL_ROOT / FRONTEND_ROOT / SERVER_ROOT
 EOF
 }
 
@@ -97,6 +110,108 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+require_option_value() {
+  local option="$1"
+  local value="${2:-}"
+  [[ -n "$value" ]] || die "Missing value for ${option}"
+}
+
+parse_frontend_option() {
+  local option="$1"
+  local value="$2"
+  require_option_value "$option" "$value"
+  case "$value" in
+    admin|user)
+      FRONTEND_APP="$value"
+      ;;
+    *)
+      die "Unsupported frontend app: $value"
+      ;;
+  esac
+}
+
+parse_shared_dependency_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --namespace)
+        require_option_value "$1" "${2:-}"
+        K8S_NAMESPACE="$2"
+        shift 2
+        ;;
+      --manager-namespace)
+        require_option_value "$1" "${2:-}"
+        TELEPRESENCE_MANAGER_NAMESPACE="$2"
+        shift 2
+        ;;
+      --install-traffic-manager)
+        INSTALL_TRAFFIC_MANAGER="true"
+        shift
+        ;;
+      --mysql-host)
+        require_option_value "$1" "${2:-}"
+        REMOTE_MYSQL_HOST="$2"
+        shift 2
+        ;;
+      --mysql-port)
+        require_option_value "$1" "${2:-}"
+        MYSQL_PORT="$2"
+        shift 2
+        ;;
+      --mysql-database)
+        require_option_value "$1" "${2:-}"
+        MYSQL_DATABASE="$2"
+        shift 2
+        ;;
+      --mysql-user)
+        require_option_value "$1" "${2:-}"
+        SERVER_DB_USER="$2"
+        shift 2
+        ;;
+      --mysql-password)
+        require_option_value "$1" "${2:-}"
+        SERVER_DB_PASSWORD="$2"
+        shift 2
+        ;;
+      --redis-host)
+        require_option_value "$1" "${2:-}"
+        REMOTE_REDIS_HOST="$2"
+        shift 2
+        ;;
+      --redis-port)
+        require_option_value "$1" "${2:-}"
+        REDIS_PORT="$2"
+        shift 2
+        ;;
+      --redis-password)
+        require_option_value "$1" "${2:-}"
+        REDIS_PASSWORD="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+parse_frontend_and_dependency_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --frontend)
+        parse_frontend_option "$1" "${2:-}"
+        shift 2
+        ;;
+      --namespace|--manager-namespace|--install-traffic-manager|--mysql-host|--mysql-port|--mysql-database|--mysql-user|--mysql-password|--redis-host|--redis-port|--redis-password)
+        parse_shared_dependency_options "$@"
+        return
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
 }
 
 ensure_state_dir() {
@@ -243,6 +358,103 @@ ensure_basic_tools() {
   ensure_python
 }
 
+ensure_frontend_tools() {
+  require_cmd curl
+  ensure_python
+}
+
+ensure_telepresence_tools() {
+  require_cmd kubectl
+  require_cmd telepresence
+}
+
+mysql_runtime_host() {
+  printf '%s\n' "$REMOTE_MYSQL_HOST"
+}
+
+mysql_runtime_port() {
+  printf '%s\n' "$MYSQL_PORT"
+}
+
+redis_runtime_host() {
+  printf '%s\n' "$REMOTE_REDIS_HOST"
+}
+
+redis_runtime_port() {
+  printf '%s\n' "$REDIS_PORT"
+}
+
+redis_runtime_url() {
+  printf 'redis://%s:%s/0\n' "$(redis_runtime_host)" "$(redis_runtime_port)"
+}
+
+frontend_service_name() {
+  if [[ "$FRONTEND_APP" == "admin" ]]; then
+    printf 'ppanel-admin-web\n'
+  else
+    printf 'ppanel-user-web\n'
+  fi
+}
+
+traffic_manager_installed() {
+  kubectl get deployment traffic-manager -n "$TELEPRESENCE_MANAGER_NAMESPACE" >/dev/null 2>&1
+}
+
+ensure_traffic_manager() {
+  if traffic_manager_installed; then
+    return
+  fi
+
+  if [[ "$INSTALL_TRAFFIC_MANAGER" != "true" ]]; then
+    die "Telepresence traffic-manager is not installed in namespace ${TELEPRESENCE_MANAGER_NAMESPACE}. Rerun with --install-traffic-manager, or install it manually with: telepresence helm install --manager-namespace ${TELEPRESENCE_MANAGER_NAMESPACE} -n ${K8S_NAMESPACE}"
+  fi
+
+  log "Installing Telepresence traffic-manager into namespace ${TELEPRESENCE_MANAGER_NAMESPACE}"
+  telepresence helm install --manager-namespace "$TELEPRESENCE_MANAGER_NAMESPACE" -n "$K8S_NAMESPACE"
+}
+
+telepresence_connect() {
+  ensure_telepresence_tools
+  ensure_traffic_manager
+
+  if telepresence status 2>&1 | grep -q 'file stale and removed'; then
+    telepresence quit --stop-daemons >/dev/null 2>&1 || true
+  fi
+
+  log "Connecting Telepresence to namespace ${K8S_NAMESPACE} (manager namespace ${TELEPRESENCE_MANAGER_NAMESPACE})"
+  telepresence connect -n "$K8S_NAMESPACE" --manager-namespace "$TELEPRESENCE_MANAGER_NAMESPACE"
+}
+
+telepresence_leave_intercept() {
+  local name="$1"
+  telepresence leave "$name" >/dev/null 2>&1 || true
+}
+
+intercept_frontend_traffic() {
+  local service
+  service="$(frontend_service_name)"
+
+  telepresence_connect
+  telepresence_leave_intercept "$service"
+
+  log "Intercepting frontend service ${K8S_NAMESPACE}/${service} to ${LOCAL_FRONTEND_HOST}:$(frontend_port)"
+  telepresence intercept "$service" \
+    --service "$service" \
+    --port "$(frontend_port):3000" \
+    --address "$LOCAL_FRONTEND_HOST"
+}
+
+intercept_server_traffic() {
+  telepresence_connect
+  telepresence_leave_intercept "ppanel-server"
+
+  log "Intercepting backend service ${K8S_NAMESPACE}/ppanel-server to ${LOCAL_SERVER_HOST}:${LOCAL_SERVER_PORT}"
+  telepresence intercept "ppanel-server" \
+    --service "ppanel-server" \
+    --port "${LOCAL_SERVER_PORT}:8080" \
+    --address "$LOCAL_SERVER_HOST"
+}
+
 frontend_dev_command() {
   if command -v bun >/dev/null 2>&1; then
     printf 'exec bun dev --host %s --port %s\n' "$LOCAL_FRONTEND_HOST" "$(frontend_port)"
@@ -338,95 +550,6 @@ docker_container_exists() {
   docker ps -a --format '{{.Names}}' | grep -qx "$name"
 }
 
-ensure_container_on_network() {
-  local name="$1"
-  if ! docker inspect -f '{{range $k, $_ := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$name" | grep -qx "$DEV_NETWORK"; then
-    docker network connect "$DEV_NETWORK" "$name" >/dev/null 2>&1 || true
-  fi
-}
-
-sync_mysql_user_grants() {
-  docker exec "$MYSQL_CONTAINER" mysql -uroot "-p${MYSQL_ROOT_PASSWORD}" <<EOF >/dev/null
-CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
-CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
-ALTER USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
-GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
-CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
-ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
-GRANT ALL PRIVILEGES ON \`${MYSQL_DATABASE}\`.* TO '${MYSQL_USER}'@'%';
-FLUSH PRIVILEGES;
-EOF
-}
-
-start_mysql() {
-  ensure_docker_network
-  if docker_container_running "$MYSQL_CONTAINER"; then
-    log "MySQL container is already running: $MYSQL_CONTAINER"
-    ensure_container_on_network "$MYSQL_CONTAINER"
-    sync_mysql_user_grants
-    return
-  fi
-
-  if docker_container_exists "$MYSQL_CONTAINER"; then
-    log "Starting existing MySQL container: $MYSQL_CONTAINER"
-    docker start "$MYSQL_CONTAINER" >/dev/null
-  else
-    log "Creating local MySQL container: $MYSQL_CONTAINER"
-    docker run -d \
-      --name "$MYSQL_CONTAINER" \
-      --network "$DEV_NETWORK" \
-      -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
-      -e MYSQL_DATABASE="$MYSQL_DATABASE" \
-      -e MYSQL_USER="$MYSQL_USER" \
-      -e MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-      -p "${MYSQL_PORT}:3306" \
-      "$MYSQL_IMAGE" \
-      --mysql-native-password=ON \
-      --bind-address=0.0.0.0 >/dev/null
-  fi
-
-  log "Waiting for MySQL to become ready"
-  local i
-  for ((i=1; i<=90; i++)); do
-    if docker exec "$MYSQL_CONTAINER" mysqladmin ping -h 127.0.0.1 -uroot "-p${MYSQL_ROOT_PASSWORD}" --silent >/dev/null 2>&1; then
-      sync_mysql_user_grants
-      return
-    fi
-    sleep 1
-  done
-  die "MySQL did not become ready in time"
-}
-
-start_redis() {
-  if docker_container_running "$REDIS_CONTAINER"; then
-    log "Redis container is already running: $REDIS_CONTAINER"
-    ensure_container_on_network "$REDIS_CONTAINER"
-    return
-  fi
-
-  if docker_container_exists "$REDIS_CONTAINER"; then
-    log "Starting existing Redis container: $REDIS_CONTAINER"
-    docker start "$REDIS_CONTAINER" >/dev/null
-  else
-    log "Creating local Redis container: $REDIS_CONTAINER"
-    docker run -d \
-      --name "$REDIS_CONTAINER" \
-      --network "$DEV_NETWORK" \
-      -p "${REDIS_PORT}:6379" \
-      "$REDIS_IMAGE" >/dev/null
-  fi
-
-  log "Waiting for Redis to become ready"
-  local i
-  for ((i=1; i<=60; i++)); do
-    if docker exec "$REDIS_CONTAINER" redis-cli ping >/dev/null 2>&1; then
-      return
-    fi
-    sleep 1
-  done
-  die "Redis did not become ready in time"
-}
-
 stop_conflicting_compose_server() {
   if docker_container_running "ppanel-server"; then
     log "Stopping existing dockerized ppanel-server to free port ${LOCAL_SERVER_PORT}"
@@ -456,8 +579,8 @@ ensure_server_process() {
     --network "$DEV_NETWORK" \
     -p "${LOCAL_SERVER_PORT}:8080" \
     -v "${SERVER_ROOT}/etc:/app/etc" \
-    -e PPANEL_DB="${SERVER_DB_USER}:${SERVER_DB_PASSWORD}@tcp(${MYSQL_CONTAINER}:3306)/${MYSQL_DATABASE}?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai" \
-    -e PPANEL_REDIS="redis://${REDIS_CONTAINER}:6379/0" \
+    -e PPANEL_DB="${SERVER_DB_USER}:${SERVER_DB_PASSWORD}@tcp($(mysql_runtime_host):$(mysql_runtime_port))/${MYSQL_DATABASE}?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai" \
+    -e PPANEL_REDIS="$(redis_runtime_url)" \
     "$SERVER_IMAGE" >/dev/null
 
   if server_config_initialized; then
@@ -479,19 +602,20 @@ normalize_server_config() {
     return
   fi
 
-  python3 - "$CONFIG_PATH" "$MYSQL_CONTAINER" "$MYSQL_DATABASE" "$SERVER_DB_USER" "$SERVER_DB_PASSWORD" "$REDIS_CONTAINER" <<'PY'
+  python3 - "$CONFIG_PATH" "$(mysql_runtime_host)" "$(mysql_runtime_port)" "$MYSQL_DATABASE" "$SERVER_DB_USER" "$SERVER_DB_PASSWORD" "$(redis_runtime_host)" "$(redis_runtime_port)" "$REDIS_PASSWORD" <<'PY'
 import re
 import sys
 
-path, mysql_host, mysql_db, mysql_user, mysql_password, redis_host = sys.argv[1:]
+path, mysql_host, mysql_port, mysql_db, mysql_user, mysql_password, redis_host, redis_port, redis_password = sys.argv[1:]
 text = open(path, "r", encoding="utf-8").read()
 
 replacements = [
-    (r"(?m)^    Addr: .*$", f"    Addr: {mysql_host}:3306"),
+    (r"(?m)^    Addr: .*$", f"    Addr: {mysql_host}:{mysql_port}"),
     (r"(?m)^    Username: .*$", f"    Username: {mysql_user}"),
     (r"(?m)^    Password: .*$", f"    Password: {mysql_password}"),
     (r"(?m)^    Dbname: .*$", f"    Dbname: {mysql_db}"),
-    (r"(?m)^    Host: .*$", f"    Host: {redis_host}:6379"),
+    (r"(?m)^    Host: .*$", f"    Host: {redis_host}:{redis_port}"),
+    (r"(?m)^    Pass: .*$", f"    Pass: {redis_password}"),
 ]
 
 for pattern, replacement in replacements:
@@ -535,7 +659,7 @@ initialize_backend_if_needed() {
     -X POST \
     "http://127.0.0.1:8080/init/config" \
     -d "$(cat <<EOF
-{"adminEmail":"${ADMIN_EMAIL}","adminPassword":"${ADMIN_PASSWORD}","mysqlHost":"127.0.0.1","mysqlPort":"${MYSQL_PORT}","mysqlDatabase":"${MYSQL_DATABASE}","mysqlUser":"${SERVER_DB_USER}","mysqlPassword":"${SERVER_DB_PASSWORD}","redisHost":"127.0.0.1","redisPort":"${REDIS_PORT}","redisPassword":""}
+{"adminEmail":"${ADMIN_EMAIL}","adminPassword":"${ADMIN_PASSWORD}","mysqlHost":"$(mysql_runtime_host)","mysqlPort":"$(mysql_runtime_port)","mysqlDatabase":"${MYSQL_DATABASE}","mysqlUser":"${SERVER_DB_USER}","mysqlPassword":"${SERVER_DB_PASSWORD}","redisHost":"$(redis_runtime_host)","redisPort":"$(redis_runtime_port)","redisPassword":"${REDIS_PASSWORD}"}
 EOF
 )" >/dev/null
 
@@ -567,12 +691,7 @@ ensure_admin_user() {
 EOF
 )" >/dev/null || true
 
-  docker exec "$MYSQL_CONTAINER" mysql -uroot "-p${MYSQL_ROOT_PASSWORD}" "$MYSQL_DATABASE" <<EOF >/dev/null
-UPDATE user AS u
-JOIN user_auth_methods AS m ON m.user_id = u.id
-SET u.is_admin = 1
-WHERE m.auth_type = 'email' AND m.auth_identifier = '${ADMIN_EMAIL}';
-EOF
+  die "Admin login failed and the script cannot auto-promote a user in shared MySQL. Set ADMIN_EMAIL/ADMIN_PASSWORD to an existing admin account before rerunning."
 }
 
 admin_token() {
@@ -661,10 +780,9 @@ run_auth_self_check() {
   log "Telegram redirect: $telegram_redirect"
 }
 
-ensure_backend() {
+ensure_server_backend() {
   ensure_basic_tools
-  start_mysql
-  start_redis
+  log "Using shared dependencies: MySQL $(mysql_runtime_host):$(mysql_runtime_port), Redis $(redis_runtime_host):$(redis_runtime_port)"
   ensure_server_process
   initialize_backend_if_needed
   configure_oauth_methods
@@ -672,8 +790,15 @@ ensure_backend() {
 }
 
 start_frontend() {
-  ensure_backend
+  local api_base_url="${1:-}"
+
+  ensure_frontend_tools
   ensure_state_dir
+
+  if [[ -z "$api_base_url" ]] && wait_for_http_status "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)" 5 1; then
+    log "Frontend is already reachable at http://${LOCAL_FRONTEND_HOST}:$(frontend_port); reusing existing dev server"
+    return
+  fi
 
   local pid
   pid="$(read_pid "$FRONTEND_PID_FILE")"
@@ -688,17 +813,42 @@ start_frontend() {
 
   log "Starting local frontend (${FRONTEND_APP})"
   : >"$FRONTEND_LOG_FILE"
-  VITE_API_BASE_URL="$SERVER_URL" \
-  VITE_API_PREFIX="" \
-  start_detached_process \
-    "$FRONTEND_PID_FILE" \
-    "$FRONTEND_LOG_FILE" \
-    "$(frontend_dir)" \
-    /bin/sh -lc "$(frontend_dev_command)"
+  if [[ -n "$api_base_url" ]]; then
+    VITE_API_BASE_URL="$api_base_url" \
+    VITE_API_PREFIX="" \
+    start_detached_process \
+      "$FRONTEND_PID_FILE" \
+      "$FRONTEND_LOG_FILE" \
+      "$(frontend_dir)" \
+      /bin/sh -lc "$(frontend_dev_command)"
+  else
+    start_detached_process \
+      "$FRONTEND_PID_FILE" \
+      "$FRONTEND_LOG_FILE" \
+      "$(frontend_dir)" \
+      /bin/sh -lc "$(frontend_dev_command)"
+  fi
 
   if ! wait_for_http "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)" 90 1; then
     die "Frontend did not become ready. See $FRONTEND_LOG_FILE"
   fi
+}
+
+up_frontend() {
+  start_frontend
+  intercept_frontend_traffic
+}
+
+up_server() {
+  ensure_server_backend
+  intercept_server_traffic
+}
+
+up_both() {
+  ensure_server_backend
+  start_frontend "$SERVER_URL"
+  intercept_server_traffic
+  intercept_frontend_traffic
 }
 
 stop_pid_file() {
@@ -715,6 +865,7 @@ stop_pid_file() {
 }
 
 leave_server() {
+  telepresence_leave_intercept "ppanel-server"
   if docker_container_exists "$SERVER_CONTAINER"; then
     log "Stopping local server container: $SERVER_CONTAINER"
     docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1 || true
@@ -722,6 +873,8 @@ leave_server() {
 }
 
 leave_frontend() {
+  telepresence_leave_intercept "ppanel-admin-web"
+  telepresence_leave_intercept "ppanel-user-web"
   stop_pid_file "$FRONTEND_PID_FILE" "frontend dev server"
 }
 
@@ -734,48 +887,36 @@ status() {
 
   printf 'Server process:   %s\n' "$(docker_container_running "$SERVER_CONTAINER" && printf 'running (container %s)' "$SERVER_CONTAINER" || printf 'stopped')"
   printf 'Frontend process: %s\n' "$(is_pid_running "$frontend_pid" && printf 'running (pid %s)' "$frontend_pid" || printf 'stopped')"
-  printf 'MySQL container:  %s\n' "$(docker_container_running "$MYSQL_CONTAINER" && printf 'running' || printf 'stopped')"
-  printf 'Redis container:  %s\n' "$(docker_container_running "$REDIS_CONTAINER" && printf 'running' || printf 'stopped')"
+  printf 'MySQL target:     %s:%s\n' "$(mysql_runtime_host)" "$(mysql_runtime_port)"
+  printf 'Redis target:     %s:%s\n' "$(redis_runtime_host)" "$(redis_runtime_port)"
+  printf 'K8s namespace:    %s\n' "$K8S_NAMESPACE"
+  printf 'TP manager ns:    %s\n' "$TELEPRESENCE_MANAGER_NAMESPACE"
   printf 'Server URL:       %s\n' "$SERVER_URL"
   printf 'Frontend URL:     %s\n' "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)"
   printf 'Server log:       %s\n' "$SERVER_LOG_FILE"
   printf 'Frontend log:     %s\n' "$FRONTEND_LOG_FILE"
+
+  if command -v telepresence >/dev/null 2>&1; then
+    printf '\nTelepresence:\n'
+    telepresence status 2>&1 || true
+    telepresence list --intercepts 2>&1 || true
+  fi
 }
 
 case "$ACTION" in
   up)
     case "$TARGET" in
       frontend)
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --frontend)
-              FRONTEND_APP="${2:-user}"
-              shift 2
-              ;;
-            *)
-              die "Unknown argument: $1"
-              ;;
-          esac
-        done
-        start_frontend
+        parse_frontend_and_dependency_options "$@"
+        up_frontend
         ;;
       server)
-        ensure_backend
+        parse_shared_dependency_options "$@"
+        up_server
         ;;
       both)
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --frontend)
-              FRONTEND_APP="${2:-user}"
-              shift 2
-              ;;
-            *)
-              die "Unknown argument: $1"
-              ;;
-          esac
-        done
-        ensure_backend
-        start_frontend
+        parse_frontend_and_dependency_options "$@"
+        up_both
         ;;
       *)
         usage
@@ -784,7 +925,8 @@ case "$ACTION" in
     esac
     ;;
   test-auth)
-    ensure_backend
+    parse_shared_dependency_options "$@"
+    ensure_server_backend
     ;;
   status)
     status
