@@ -33,13 +33,16 @@ VITE_DEVTOOLS_PORT=42170 \
 ```
 
 - `up frontend`: route traffic to a local frontend while keeping the k3s backend
-- `up server`: route traffic to a local backend while keeping shared MySQL / Redis
-- `up both`: route traffic to both a local frontend and a local backend while still using shared MySQL / Redis
+- `up server`: route traffic to a local backend and automatically resolve the active k3s MySQL / Redis dependencies
+- `up both`: route traffic to both a local frontend and a local backend while the local backend still reuses the active k3s MySQL / Redis dependencies
 
-By default the script connects to shared dependencies through `host.docker.internal:13306` and `host.docker.internal:16379`.
-The script uses Telepresence to connect to the `ppanel-dev` namespace and create intercepts for the frontend or backend workloads.
+Before replacing workloads, the script reads the real backend dependency config from `ppanel-secret` in the `ppanel-dev` namespace, prints the resolved values, and unless you explicitly override them, automatically port-forwards the k3s MySQL / Redis services for the local backend runtime.
+If the local replacement runtime cannot reach those dependencies, the script now fails fast.
+The script also prints the active admin email and automatically lowers Telepresence traffic-agent resource defaults before connecting so development namespace quotas are less likely to block intercepts.
 
-If you want to make the shared dependency targets explicit, pass them through CLI options instead of environment variables, for example:
+`up frontend` also forces the frontend API target back to `/api` on the intercepted domain so it does not accidentally inherit `127.0.0.1:8080` from a local `.env.local`.
+
+If you want to override the auto-resolved dependency targets, pass them through CLI options instead of environment variables, for example:
 
 ```bash
 ./telepresence.sh up server \
@@ -50,6 +53,19 @@ If you want to make the shared dependency targets explicit, pass them through CL
   --mysql-password dev-root-password \
   --redis-host host.docker.internal \
   --redis-port 16379
+```
+
+If you need to tune the Telepresence traffic-agent resource profile, you can override the defaults with:
+
+```bash
+TELEPRESENCE_AGENT_REQUEST_CPU=10m
+TELEPRESENCE_AGENT_LIMIT_CPU=25m
+TELEPRESENCE_AGENT_REQUEST_MEMORY=32Mi
+TELEPRESENCE_AGENT_LIMIT_MEMORY=64Mi
+TELEPRESENCE_AGENT_INIT_REQUEST_CPU=5m
+TELEPRESENCE_AGENT_INIT_LIMIT_CPU=10m
+TELEPRESENCE_AGENT_INIT_REQUEST_MEMORY=16Mi
+TELEPRESENCE_AGENT_INIT_LIMIT_MEMORY=32Mi
 ```
 
 If the cluster does not have a Telepresence `traffic-manager` yet, append `--install-traffic-manager` on the first run.

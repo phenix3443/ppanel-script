@@ -33,13 +33,16 @@ VITE_DEVTOOLS_PORT=42170 \
 ```
 
 - `up frontend`：切到本地前端，后端继续使用 k3s 中的部署
-- `up server`：切到本地后端，依赖继续使用共享的 MySQL / Redis
-- `up both`：前后端都切到本地；依赖仍使用共享的 MySQL / Redis
+- `up server`：切到本地后端，并自动解析当前 k3s `ppanel-server` 的 MySQL / Redis 依赖
+- `up both`：前后端都切到本地；本地后端仍自动复用 k3s 中的 MySQL / Redis
 
-默认会通过 `host.docker.internal:13306` 和 `host.docker.internal:16379` 连接共享依赖。
-脚本会使用 Telepresence 连接 `ppanel-dev` 命名空间，并为前端或后端创建 intercept。
+脚本会先从 `ppanel-dev` 命名空间里的 `ppanel-secret` 读取当前部署使用的真实依赖配置，打印解析结果，并在未显式覆盖时自动将 k3s 的 MySQL / Redis 端口转发到本地，再让本地 `ppanel-server` 通过这些链路访问依赖。
+如果依赖无法从本地替代运行环境连通，脚本会直接报错退出。
+脚本也会打印当前生效的管理员邮箱，并在连接 Telepresence 前自动将 traffic-agent 的默认资源请求压低到适合开发环境 quota 的水平。
 
-如果要显式指定共享依赖，请直接通过命令行参数传入，而不是依赖环境变量，例如：
+`up frontend` 模式会显式将前端 API 指向被 intercept 域名下的 `/api`，避免误用本地 `.env.local` 里的 `127.0.0.1:8080`。
+
+如果要显式覆盖自动发现到的依赖，请直接通过命令行参数传入，而不是依赖环境变量，例如：
 
 ```sh
 ./telepresence.sh up server \
@@ -50,6 +53,19 @@ VITE_DEVTOOLS_PORT=42170 \
   --mysql-password dev-root-password \
   --redis-host host.docker.internal \
   --redis-port 16379
+```
+
+如果需要调整 Telepresence traffic-agent 的资源配置，可以通过以下环境变量覆盖默认值：
+
+```sh
+TELEPRESENCE_AGENT_REQUEST_CPU=10m
+TELEPRESENCE_AGENT_LIMIT_CPU=25m
+TELEPRESENCE_AGENT_REQUEST_MEMORY=32Mi
+TELEPRESENCE_AGENT_LIMIT_MEMORY=64Mi
+TELEPRESENCE_AGENT_INIT_REQUEST_CPU=5m
+TELEPRESENCE_AGENT_INIT_LIMIT_CPU=10m
+TELEPRESENCE_AGENT_INIT_REQUEST_MEMORY=16Mi
+TELEPRESENCE_AGENT_INIT_LIMIT_MEMORY=32Mi
 ```
 
 如果集群里还没有安装 Telepresence `traffic-manager`，可以在首次执行时追加 `--install-traffic-manager`。

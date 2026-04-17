@@ -5,6 +5,9 @@ set -euo pipefail
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+ADMIN_EMAIL_SET_IN_ENV="${ADMIN_EMAIL+x}"
+ADMIN_PASSWORD_SET_IN_ENV="${ADMIN_PASSWORD+x}"
+
 ACTION="${1:-help}"
 TARGET="${2:-}"
 shift $(( $# > 0 ? 1 : 0 )) || true
@@ -19,6 +22,10 @@ SERVER_PID_FILE="$STATE_DIR/server.pid"
 FRONTEND_PID_FILE="$STATE_DIR/frontend.pid"
 SERVER_LOG_FILE="$STATE_DIR/server.log"
 FRONTEND_LOG_FILE="$STATE_DIR/frontend.log"
+MYSQL_PORT_FORWARD_PID_FILE="$STATE_DIR/mysql-port-forward.pid"
+REDIS_PORT_FORWARD_PID_FILE="$STATE_DIR/redis-port-forward.pid"
+MYSQL_PORT_FORWARD_LOG_FILE="$STATE_DIR/mysql-port-forward.log"
+REDIS_PORT_FORWARD_LOG_FILE="$STATE_DIR/redis-port-forward.log"
 DEV_NETWORK="ppanel-local-dev"
 SERVER_CONTAINER="ppanel-local-server"
 SERVER_IMAGE="ppanel-server-ppanel"
@@ -34,17 +41,45 @@ REMOTE_REDIS_HOST="host.docker.internal"
 K8S_NAMESPACE="ppanel-dev"
 TELEPRESENCE_MANAGER_NAMESPACE="ppanel-dev"
 INSTALL_TRAFFIC_MANAGER="false"
+TELEPRESENCE_AGENT_REQUEST_CPU="${TELEPRESENCE_AGENT_REQUEST_CPU:-10m}"
+TELEPRESENCE_AGENT_LIMIT_CPU="${TELEPRESENCE_AGENT_LIMIT_CPU:-25m}"
+TELEPRESENCE_AGENT_REQUEST_MEMORY="${TELEPRESENCE_AGENT_REQUEST_MEMORY:-32Mi}"
+TELEPRESENCE_AGENT_LIMIT_MEMORY="${TELEPRESENCE_AGENT_LIMIT_MEMORY:-64Mi}"
+TELEPRESENCE_AGENT_INIT_REQUEST_CPU="${TELEPRESENCE_AGENT_INIT_REQUEST_CPU:-5m}"
+TELEPRESENCE_AGENT_INIT_LIMIT_CPU="${TELEPRESENCE_AGENT_INIT_LIMIT_CPU:-10m}"
+TELEPRESENCE_AGENT_INIT_REQUEST_MEMORY="${TELEPRESENCE_AGENT_INIT_REQUEST_MEMORY:-16Mi}"
+TELEPRESENCE_AGENT_INIT_LIMIT_MEMORY="${TELEPRESENCE_AGENT_INIT_LIMIT_MEMORY:-32Mi}"
 
 MYSQL_PORT="13306"
 MYSQL_DATABASE="ppanel_dev"
 SERVER_DB_USER="root"
 SERVER_DB_PASSWORD="dev-root-password"
+MYSQL_SOURCE_SERVICE=""
+MYSQL_SOURCE_PORT=""
+MYSQL_HOST_OVERRIDDEN="false"
+MYSQL_PORT_OVERRIDDEN="false"
+MYSQL_DATABASE_OVERRIDDEN="false"
+MYSQL_USER_OVERRIDDEN="false"
+MYSQL_PASSWORD_OVERRIDDEN="false"
 
 REDIS_PORT="16379"
 REDIS_PASSWORD=""
+REDIS_SOURCE_SERVICE=""
+REDIS_SOURCE_PORT=""
+REDIS_HOST_OVERRIDDEN="false"
+REDIS_PORT_OVERRIDDEN="false"
+REDIS_PASSWORD_OVERRIDDEN="false"
 
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@ppanel.dev}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-password}"
+ADMIN_EMAIL_OVERRIDDEN="false"
+ADMIN_PASSWORD_OVERRIDDEN="false"
+if [[ -n "$ADMIN_EMAIL_SET_IN_ENV" ]]; then
+  ADMIN_EMAIL_OVERRIDDEN="true"
+fi
+if [[ -n "$ADMIN_PASSWORD_SET_IN_ENV" ]]; then
+  ADMIN_PASSWORD_OVERRIDDEN="true"
+fi
 
 # These defaults are intentionally local placeholders. Replace them with real
 # provider credentials in your shell env if you want to complete the provider
@@ -71,7 +106,8 @@ What this script does now:
   - up frontend: starts/reuses a local frontend and intercepts frontend traffic with Telepresence
   - up server: starts a local backend and intercepts API traffic with Telepresence
   - up both: intercepts both frontend + backend traffic with Telepresence
-  - Always uses shared MySQL/Redis for the local backend
+  - Resolves backend dependencies from the currently deployed k3s config before replacing workloads
+  - Port-forwards k3s MySQL/Redis for the local backend unless explicit dependency overrides are provided
   - Initializes the backend automatically if needed and runs OAuth redirect self-checks
 
 Shared dependency options:
@@ -83,7 +119,7 @@ Shared dependency options:
   --redis-host HOST
   --redis-port PORT
   --redis-password PASSWORD
-  Defaults: host.docker.internal:13306 for MySQL, host.docker.internal:16379 for Redis
+  Defaults: discover from k3s ppanel-server config and forward locally for docker access
 
 Telepresence options:
   --namespace NS
@@ -95,6 +131,10 @@ Still configurable via env vars:
   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
   TELEGRAM_BOT_TOKEN
   ADMIN_EMAIL / ADMIN_PASSWORD
+  TELEPRESENCE_AGENT_REQUEST_CPU / TELEPRESENCE_AGENT_LIMIT_CPU
+  TELEPRESENCE_AGENT_REQUEST_MEMORY / TELEPRESENCE_AGENT_LIMIT_MEMORY
+  TELEPRESENCE_AGENT_INIT_REQUEST_CPU / TELEPRESENCE_AGENT_INIT_LIMIT_CPU
+  TELEPRESENCE_AGENT_INIT_REQUEST_MEMORY / TELEPRESENCE_AGENT_INIT_LIMIT_MEMORY
   VITE_ALLOWED_HOSTS / VITE_DEVTOOLS_PORT
 EOF
 }
@@ -152,41 +192,49 @@ parse_shared_dependency_options() {
       --mysql-host)
         require_option_value "$1" "${2:-}"
         REMOTE_MYSQL_HOST="$2"
+        MYSQL_HOST_OVERRIDDEN="true"
         shift 2
         ;;
       --mysql-port)
         require_option_value "$1" "${2:-}"
         MYSQL_PORT="$2"
+        MYSQL_PORT_OVERRIDDEN="true"
         shift 2
         ;;
       --mysql-database)
         require_option_value "$1" "${2:-}"
         MYSQL_DATABASE="$2"
+        MYSQL_DATABASE_OVERRIDDEN="true"
         shift 2
         ;;
       --mysql-user)
         require_option_value "$1" "${2:-}"
         SERVER_DB_USER="$2"
+        MYSQL_USER_OVERRIDDEN="true"
         shift 2
         ;;
       --mysql-password)
         require_option_value "$1" "${2:-}"
         SERVER_DB_PASSWORD="$2"
+        MYSQL_PASSWORD_OVERRIDDEN="true"
         shift 2
         ;;
       --redis-host)
         require_option_value "$1" "${2:-}"
         REMOTE_REDIS_HOST="$2"
+        REDIS_HOST_OVERRIDDEN="true"
         shift 2
         ;;
       --redis-port)
         require_option_value "$1" "${2:-}"
         REDIS_PORT="$2"
+        REDIS_PORT_OVERRIDDEN="true"
         shift 2
         ;;
       --redis-password)
         require_option_value "$1" "${2:-}"
         REDIS_PASSWORD="$2"
+        REDIS_PASSWORD_OVERRIDDEN="true"
         shift 2
         ;;
       *)
@@ -368,6 +416,247 @@ ensure_telepresence_tools() {
   require_cmd telepresence
 }
 
+wait_for_tcp() {
+  local host="$1"
+  local port="$2"
+  local attempts="${3:-60}"
+  local sleep_seconds="${4:-1}"
+
+  python3 - "$host" "$port" "$attempts" "$sleep_seconds" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+attempts = int(sys.argv[3])
+sleep_seconds = float(sys.argv[4])
+
+for _ in range(attempts):
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            sys.exit(0)
+    except OSError:
+        time.sleep(sleep_seconds)
+
+sys.exit(1)
+PY
+}
+
+ensure_tcp_reachable() {
+  local host="$1"
+  local port="$2"
+  local label="$3"
+  wait_for_tcp "$host" "$port" 10 1 || die "${label} is not reachable at ${host}:${port}"
+}
+
+extract_config_field() {
+  local yaml_payload="$1"
+  local path="$2"
+  YAML_PAYLOAD="$yaml_payload" python3 - "$path" <<'PY'
+import os
+import re
+import sys
+
+payload = os.environ["YAML_PAYLOAD"]
+path = sys.argv[1].split(".")
+
+current_section = None
+values = {}
+
+for raw_line in payload.splitlines():
+    line = raw_line.rstrip()
+    if not line or line.lstrip().startswith("#"):
+        continue
+
+    section_match = re.match(r"^([A-Za-z0-9_]+):\s*$", line)
+    if section_match:
+        current_section = section_match.group(1)
+        continue
+
+    field_match = re.match(r"^\s{2}([A-Za-z0-9_]+):\s*(.*)\s*$", line)
+    if field_match and current_section:
+        value = field_match.group(2).strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+        values[f"{current_section}.{field_match.group(1)}"] = value
+
+print(values.get(".".join(path), ""))
+PY
+}
+
+split_host_port() {
+  local addr="$1"
+  local default_port="$2"
+
+  python3 - "$addr" "$default_port" <<'PY'
+import sys
+
+addr = sys.argv[1]
+default_port = sys.argv[2]
+
+if ":" in addr:
+    host, port = addr.rsplit(":", 1)
+else:
+    host, port = addr, default_port
+
+print(host)
+print(port)
+PY
+}
+
+cluster_server_config() {
+  kubectl get secret -n "$K8S_NAMESPACE" ppanel-secret -o jsonpath='{.data.ppanel\.yaml}' | base64 --decode
+}
+
+resolve_cluster_dependencies() {
+  ensure_telepresence_tools
+
+  local config mysql_addr redis_addr mysql_parts redis_parts
+  config="$(cluster_server_config)" || die "Failed to read ppanel-secret from namespace ${K8S_NAMESPACE}"
+
+  mysql_addr="$(extract_config_field "$config" "MySQL.Addr")"
+  [[ -n "$mysql_addr" ]] || die "Failed to resolve MySQL.Addr from k3s ppanel-secret"
+  mysql_parts="$(split_host_port "$mysql_addr" "3306")"
+  MYSQL_SOURCE_SERVICE="$(printf '%s\n' "$mysql_parts" | sed -n '1p')"
+  MYSQL_SOURCE_PORT="$(printf '%s\n' "$mysql_parts" | sed -n '2p')"
+
+  redis_addr="$(extract_config_field "$config" "Redis.Host")"
+  [[ -n "$redis_addr" ]] || die "Failed to resolve Redis.Host from k3s ppanel-secret"
+  redis_parts="$(split_host_port "$redis_addr" "6379")"
+  REDIS_SOURCE_SERVICE="$(printf '%s\n' "$redis_parts" | sed -n '1p')"
+  REDIS_SOURCE_PORT="$(printf '%s\n' "$redis_parts" | sed -n '2p')"
+
+  if [[ "$MYSQL_DATABASE_OVERRIDDEN" != "true" ]]; then
+    MYSQL_DATABASE="$(extract_config_field "$config" "MySQL.Dbname")"
+  fi
+  if [[ "$MYSQL_USER_OVERRIDDEN" != "true" ]]; then
+    SERVER_DB_USER="$(extract_config_field "$config" "MySQL.Username")"
+  fi
+  if [[ "$MYSQL_PASSWORD_OVERRIDDEN" != "true" ]]; then
+    SERVER_DB_PASSWORD="$(extract_config_field "$config" "MySQL.Password")"
+  fi
+  if [[ "$REDIS_PASSWORD_OVERRIDDEN" != "true" ]]; then
+    REDIS_PASSWORD="$(extract_config_field "$config" "Redis.Pass")"
+  fi
+  if [[ "$ADMIN_EMAIL_OVERRIDDEN" != "true" ]]; then
+    ADMIN_EMAIL="$(extract_config_field "$config" "Administrator.Email")"
+  fi
+  if [[ "$ADMIN_PASSWORD_OVERRIDDEN" != "true" ]]; then
+    ADMIN_PASSWORD="$(extract_config_field "$config" "Administrator.Password")"
+  fi
+}
+
+server_dependency_summary() {
+  printf 'Resolved server dependencies:\n'
+  printf '  MySQL source: %s:%s\n' "$MYSQL_SOURCE_SERVICE" "$MYSQL_SOURCE_PORT"
+  printf '  MySQL runtime target: %s:%s\n' "$(mysql_runtime_host)" "$(mysql_runtime_port)"
+  printf '  MySQL database/user: %s / %s\n' "$MYSQL_DATABASE" "$SERVER_DB_USER"
+  printf '  Redis source: %s:%s\n' "$REDIS_SOURCE_SERVICE" "$REDIS_SOURCE_PORT"
+  printf '  Redis runtime target: %s:%s\n' "$(redis_runtime_host)" "$(redis_runtime_port)"
+}
+
+frontend_dependency_summary() {
+  printf 'Resolved frontend dependency:\n'
+  printf '  Server access: same-domain /api requests routed to the k3s ppanel-server\n'
+}
+
+ensure_port_available_for_forward() {
+  local port="$1"
+  local pid_file="$2"
+  local label="$3"
+  local pid command
+
+  pid="$(find_listener_pid "$port")"
+  [[ -n "$pid" ]] || return 0
+
+  if [[ -f "$pid_file" ]] && [[ "$(read_pid "$pid_file")" == "$pid" ]]; then
+    return 0
+  fi
+
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  die "${label} local port ${port} is already in use by: ${command}"
+}
+
+ensure_dependency_port_forward() {
+  local service="$1"
+  local remote_port="$2"
+  local local_port="$3"
+  local pid_file="$4"
+  local log_file="$5"
+  local label="$6"
+  local pid
+
+  ensure_state_dir
+  pid="$(read_pid "$pid_file")"
+
+  if is_pid_running "$pid"; then
+    if wait_for_tcp "127.0.0.1" "$local_port" 3 1; then
+      log "Reusing ${label} port-forward on 127.0.0.1:${local_port} -> ${service}:${remote_port}"
+      return
+    fi
+    stop_pid_if_running "$pid"
+    rm -f "$pid_file"
+  fi
+
+  ensure_port_available_for_forward "$local_port" "$pid_file" "$label"
+
+  log "Port-forwarding ${label} from ${K8S_NAMESPACE}/${service}:${remote_port} to 127.0.0.1:${local_port}"
+  : >"$log_file"
+  start_detached_process \
+    "$pid_file" \
+    "$log_file" \
+    "$SCRIPT_DIR" \
+    kubectl port-forward -n "$K8S_NAMESPACE" "svc/${service}" "${local_port}:${remote_port}" --address 127.0.0.1
+
+  wait_for_tcp "127.0.0.1" "$local_port" 30 1 || die "${label} port-forward did not become ready. See ${log_file}"
+}
+
+validate_runtime_dependency_connectivity() {
+  local host="$1"
+  local port="$2"
+  local label="$3"
+  local host_side_host="$host"
+
+  if [[ "$host" == "host.docker.internal" ]]; then
+    host_side_host="127.0.0.1"
+  fi
+
+  ensure_tcp_reachable "$host_side_host" "$port" "${label} host-side endpoint"
+
+  docker run --rm --network "$DEV_NETWORK" busybox:1.36 sh -c "nc -z -w 2 ${host} ${port}" >/dev/null 2>&1 \
+    || die "${label} is not reachable from the local replacement runtime at ${host}:${port}"
+}
+
+prepare_backend_dependencies() {
+  ensure_docker_network
+  resolve_cluster_dependencies
+
+  if [[ "$MYSQL_HOST_OVERRIDDEN" != "true" ]] && [[ "$MYSQL_PORT_OVERRIDDEN" != "true" ]]; then
+    ensure_dependency_port_forward \
+      "$MYSQL_SOURCE_SERVICE" \
+      "$MYSQL_SOURCE_PORT" \
+      "$MYSQL_PORT" \
+      "$MYSQL_PORT_FORWARD_PID_FILE" \
+      "$MYSQL_PORT_FORWARD_LOG_FILE" \
+      "MySQL"
+  fi
+
+  if [[ "$REDIS_HOST_OVERRIDDEN" != "true" ]] && [[ "$REDIS_PORT_OVERRIDDEN" != "true" ]]; then
+    ensure_dependency_port_forward \
+      "$REDIS_SOURCE_SERVICE" \
+      "$REDIS_SOURCE_PORT" \
+      "$REDIS_PORT" \
+      "$REDIS_PORT_FORWARD_PID_FILE" \
+      "$REDIS_PORT_FORWARD_LOG_FILE" \
+      "Redis"
+  fi
+
+  server_dependency_summary
+  validate_runtime_dependency_connectivity "$(mysql_runtime_host)" "$(mysql_runtime_port)" "MySQL"
+  validate_runtime_dependency_connectivity "$(redis_runtime_host)" "$(redis_runtime_port)" "Redis"
+}
+
 mysql_runtime_host() {
   printf '%s\n' "$REMOTE_MYSQL_HOST"
 }
@@ -413,9 +702,26 @@ ensure_traffic_manager() {
   telepresence helm install --manager-namespace "$TELEPRESENCE_MANAGER_NAMESPACE" -n "$K8S_NAMESPACE"
 }
 
+reconcile_traffic_agent_resources() {
+  log "Reconciling Telepresence traffic-agent resources for namespace quota"
+  telepresence helm upgrade \
+    --reuse-values \
+    --manager-namespace "$TELEPRESENCE_MANAGER_NAMESPACE" \
+    -n "$K8S_NAMESPACE" \
+    --set-string "agent.resources.requests.cpu=${TELEPRESENCE_AGENT_REQUEST_CPU}" \
+    --set-string "agent.resources.limits.cpu=${TELEPRESENCE_AGENT_LIMIT_CPU}" \
+    --set-string "agent.resources.requests.memory=${TELEPRESENCE_AGENT_REQUEST_MEMORY}" \
+    --set-string "agent.resources.limits.memory=${TELEPRESENCE_AGENT_LIMIT_MEMORY}" \
+    --set-string "agent.initResources.requests.cpu=${TELEPRESENCE_AGENT_INIT_REQUEST_CPU}" \
+    --set-string "agent.initResources.limits.cpu=${TELEPRESENCE_AGENT_INIT_LIMIT_CPU}" \
+    --set-string "agent.initResources.requests.memory=${TELEPRESENCE_AGENT_INIT_REQUEST_MEMORY}" \
+    --set-string "agent.initResources.limits.memory=${TELEPRESENCE_AGENT_INIT_LIMIT_MEMORY}" >/dev/null
+}
+
 telepresence_connect() {
   ensure_telepresence_tools
   ensure_traffic_manager
+  reconcile_traffic_agent_resources
 
   if telepresence status 2>&1 | grep -q 'file stale and removed'; then
     telepresence quit --stop-daemons >/dev/null 2>&1 || true
@@ -441,7 +747,8 @@ intercept_frontend_traffic() {
   telepresence intercept "$service" \
     --service "$service" \
     --port "$(frontend_port):3000" \
-    --address "$LOCAL_FRONTEND_HOST"
+    --address "$LOCAL_FRONTEND_HOST" \
+    --mount=false
 }
 
 intercept_server_traffic() {
@@ -452,7 +759,8 @@ intercept_server_traffic() {
   telepresence intercept "ppanel-server" \
     --service "ppanel-server" \
     --port "${LOCAL_SERVER_PORT}:8080" \
-    --address "$LOCAL_SERVER_HOST"
+    --address "$LOCAL_SERVER_HOST" \
+    --mount=false
 }
 
 frontend_dev_command() {
@@ -782,7 +1090,7 @@ run_auth_self_check() {
 
 ensure_server_backend() {
   ensure_basic_tools
-  log "Using shared dependencies: MySQL $(mysql_runtime_host):$(mysql_runtime_port), Redis $(redis_runtime_host):$(redis_runtime_port)"
+  prepare_backend_dependencies
   ensure_server_process
   initialize_backend_if_needed
   configure_oauth_methods
@@ -791,6 +1099,7 @@ ensure_server_backend() {
 
 start_frontend() {
   local api_base_url="${1:-}"
+  local api_prefix="${2:-}"
 
   ensure_frontend_tools
   ensure_state_dir
@@ -813,21 +1122,13 @@ start_frontend() {
 
   log "Starting local frontend (${FRONTEND_APP})"
   : >"$FRONTEND_LOG_FILE"
-  if [[ -n "$api_base_url" ]]; then
-    VITE_API_BASE_URL="$api_base_url" \
-    VITE_API_PREFIX="" \
-    start_detached_process \
-      "$FRONTEND_PID_FILE" \
-      "$FRONTEND_LOG_FILE" \
-      "$(frontend_dir)" \
-      /bin/sh -lc "$(frontend_dev_command)"
-  else
-    start_detached_process \
-      "$FRONTEND_PID_FILE" \
-      "$FRONTEND_LOG_FILE" \
-      "$(frontend_dir)" \
-      /bin/sh -lc "$(frontend_dev_command)"
-  fi
+  VITE_API_BASE_URL="$api_base_url" \
+  VITE_API_PREFIX="$api_prefix" \
+  start_detached_process \
+    "$FRONTEND_PID_FILE" \
+    "$FRONTEND_LOG_FILE" \
+    "$(frontend_dir)" \
+    /bin/sh -lc "$(frontend_dev_command)"
 
   if ! wait_for_http "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)" 90 1; then
     die "Frontend did not become ready. See $FRONTEND_LOG_FILE"
@@ -835,20 +1136,53 @@ start_frontend() {
 }
 
 up_frontend() {
-  start_frontend
+  resolve_cluster_dependencies
+  frontend_dependency_summary
+  start_frontend "" "/api"
   intercept_frontend_traffic
+  print_success_summary "frontend"
 }
 
 up_server() {
   ensure_server_backend
   intercept_server_traffic
+  print_success_summary "server"
 }
 
 up_both() {
   ensure_server_backend
-  start_frontend "$SERVER_URL"
+  start_frontend "$SERVER_URL" ""
   intercept_server_traffic
   intercept_frontend_traffic
+  print_success_summary "both"
+}
+
+print_success_summary() {
+  local mode="$1"
+  local frontend_domain
+
+  if [[ "$FRONTEND_APP" == "admin" ]]; then
+    frontend_domain="http://admin-ppanel-dev.home.arpa"
+  else
+    frontend_domain="http://ppanel-dev.home.arpa"
+  fi
+
+  printf '\n'
+  printf '========================================\n'
+  printf 'PPanel local-dev is ready\n'
+  printf 'Mode: %s\n' "$mode"
+  printf 'Frontend app: %s\n' "$FRONTEND_APP"
+  printf 'Frontend entry: %s\n' "$frontend_domain"
+  printf 'Local frontend: http://%s:%s\n' "$LOCAL_FRONTEND_HOST" "$(frontend_port)"
+  if [[ "$mode" == "frontend" ]]; then
+    printf 'Server access: same-domain /api requests routed to the k3s ppanel-server\n'
+  else
+    printf 'Local backend: %s\n' "$SERVER_URL"
+    printf 'Server mode: local ppanel-server with k3s MySQL/Redis dependencies\n'
+  fi
+  printf 'Admin email: %s\n' "$ADMIN_EMAIL"
+  printf 'Admin password: %s\n' "$ADMIN_PASSWORD"
+  printf '========================================\n'
 }
 
 stop_pid_file() {
@@ -870,6 +1204,8 @@ leave_server() {
     log "Stopping local server container: $SERVER_CONTAINER"
     docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1 || true
   fi
+  stop_pid_file "$MYSQL_PORT_FORWARD_PID_FILE" "MySQL port-forward"
+  stop_pid_file "$REDIS_PORT_FORWARD_PID_FILE" "Redis port-forward"
 }
 
 leave_frontend() {
@@ -889,12 +1225,16 @@ status() {
   printf 'Frontend process: %s\n' "$(is_pid_running "$frontend_pid" && printf 'running (pid %s)' "$frontend_pid" || printf 'stopped')"
   printf 'MySQL target:     %s:%s\n' "$(mysql_runtime_host)" "$(mysql_runtime_port)"
   printf 'Redis target:     %s:%s\n' "$(redis_runtime_host)" "$(redis_runtime_port)"
+  printf 'MySQL source:     %s:%s\n' "${MYSQL_SOURCE_SERVICE:-unknown}" "${MYSQL_SOURCE_PORT:-unknown}"
+  printf 'Redis source:     %s:%s\n' "${REDIS_SOURCE_SERVICE:-unknown}" "${REDIS_SOURCE_PORT:-unknown}"
   printf 'K8s namespace:    %s\n' "$K8S_NAMESPACE"
   printf 'TP manager ns:    %s\n' "$TELEPRESENCE_MANAGER_NAMESPACE"
   printf 'Server URL:       %s\n' "$SERVER_URL"
   printf 'Frontend URL:     %s\n' "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)"
   printf 'Server log:       %s\n' "$SERVER_LOG_FILE"
   printf 'Frontend log:     %s\n' "$FRONTEND_LOG_FILE"
+  printf 'MySQL PF log:     %s\n' "$MYSQL_PORT_FORWARD_LOG_FILE"
+  printf 'Redis PF log:     %s\n' "$REDIS_PORT_FORWARD_LOG_FILE"
 
   if command -v telepresence >/dev/null 2>&1; then
     printf '\nTelepresence:\n'
