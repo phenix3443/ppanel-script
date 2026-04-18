@@ -17,6 +17,8 @@ SERVER_ROOT="$PPANEL_ROOT/ppanel-server"
 STATE_DIR="$HOME/.cache/ppanel-local-dev"
 SERVER_PID_FILE="$STATE_DIR/server.pid"
 FRONTEND_PID_FILE="$STATE_DIR/frontend.pid"
+SERVER_STATE_FILE="$STATE_DIR/server.state"
+FRONTEND_STATE_FILE="$STATE_DIR/frontend.state"
 SERVER_LOG_FILE="$STATE_DIR/server.log"
 FRONTEND_LOG_FILE="$STATE_DIR/frontend.log"
 DEV_NETWORK="ppanel-local-dev"
@@ -27,6 +29,7 @@ FRONTEND_APP="user"
 LOCAL_SERVER_HOST="127.0.0.1"
 LOCAL_SERVER_PORT="8080"
 LOCAL_FRONTEND_HOST="127.0.0.1"
+TELEPRESENCE_LOCAL_ADDRESS="host.docker.internal"
 LOCAL_USER_PORT="3000"
 LOCAL_ADMIN_PORT="3001"
 REMOTE_MYSQL_HOST="host.docker.internal"
@@ -34,6 +37,7 @@ REMOTE_REDIS_HOST="host.docker.internal"
 K8S_NAMESPACE="ppanel-dev"
 TELEPRESENCE_MANAGER_NAMESPACE="ppanel-dev"
 INSTALL_TRAFFIC_MANAGER="false"
+TELEPRESENCE_DAEMON_NAME="${TELEPRESENCE_DAEMON_NAME:-ppanel-dev}"
 
 MYSQL_PORT="13306"
 MYSQL_DATABASE="ppanel_dev"
@@ -400,6 +404,79 @@ traffic_manager_installed() {
   kubectl get deployment traffic-manager -n "$TELEPRESENCE_MANAGER_NAMESPACE" >/dev/null 2>&1
 }
 
+telepresence_name_slug() {
+  printf '%s' "${K8S_NAMESPACE}" | tr -c '[:alnum:]-' '-'
+}
+
+telepresence_configure() {
+  TELEPRESENCE_DAEMON_NAME="ppanel-$(telepresence_name_slug)"
+}
+
+write_state_file() {
+  local file="$1"
+  shift
+  : >"$file"
+  while [[ $# -gt 0 ]]; do
+    printf '%s=%s\n' "$1" "$2" >>"$file"
+    shift 2
+  done
+}
+
+read_state_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 0
+  python3 - "$file" "$key" <<'PY'
+import sys
+
+path, key = sys.argv[1:]
+value = ""
+with open(path, "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k == key:
+            value = v
+            break
+print(value)
+PY
+}
+
+frontend_state_value() {
+  read_state_value "$FRONTEND_STATE_FILE" "$1"
+}
+
+server_state_value() {
+  read_state_value "$SERVER_STATE_FILE" "$1"
+}
+
+write_frontend_state() {
+  local api_base_url="$1"
+  write_state_file \
+    "$FRONTEND_STATE_FILE" \
+    app "$FRONTEND_APP" \
+    port "$(frontend_port)" \
+    api_base_url "$api_base_url"
+}
+
+write_server_state() {
+  write_state_file \
+    "$SERVER_STATE_FILE" \
+    mysql_host "$(mysql_runtime_host)" \
+    mysql_port "$(mysql_runtime_port)" \
+    mysql_database "$MYSQL_DATABASE" \
+    mysql_user "$SERVER_DB_USER" \
+    redis_host "$(redis_runtime_host)" \
+    redis_port "$(redis_runtime_port)" \
+    redis_password "$REDIS_PASSWORD"
+}
+
+telepresence_cmd() {
+  telepresence --use "$TELEPRESENCE_DAEMON_NAME" "$@"
+}
+
 ensure_traffic_manager() {
   if traffic_manager_installed; then
     return
@@ -416,18 +493,24 @@ ensure_traffic_manager() {
 telepresence_connect() {
   ensure_telepresence_tools
   ensure_traffic_manager
+  telepresence_configure
 
-  if telepresence status 2>&1 | grep -q 'file stale and removed'; then
+  if telepresence status 2>&1 | grep -Eq 'file stale and removed|multiple daemons are running'; then
     telepresence quit --stop-daemons >/dev/null 2>&1 || true
   fi
 
   log "Connecting Telepresence to namespace ${K8S_NAMESPACE} (manager namespace ${TELEPRESENCE_MANAGER_NAMESPACE})"
-  telepresence connect -n "$K8S_NAMESPACE" --manager-namespace "$TELEPRESENCE_MANAGER_NAMESPACE"
+  telepresence connect \
+    --docker \
+    --name "$TELEPRESENCE_DAEMON_NAME" \
+    -n "$K8S_NAMESPACE" \
+    --manager-namespace "$TELEPRESENCE_MANAGER_NAMESPACE"
 }
 
 telepresence_leave_intercept() {
   local name="$1"
-  telepresence leave "$name" >/dev/null 2>&1 || true
+  telepresence_configure
+  telepresence_cmd leave "$name" >/dev/null 2>&1 || true
 }
 
 intercept_frontend_traffic() {
@@ -437,22 +520,22 @@ intercept_frontend_traffic() {
   telepresence_connect
   telepresence_leave_intercept "$service"
 
-  log "Intercepting frontend service ${K8S_NAMESPACE}/${service} to ${LOCAL_FRONTEND_HOST}:$(frontend_port)"
-  telepresence intercept "$service" \
+  log "Intercepting frontend service ${K8S_NAMESPACE}/${service} to ${TELEPRESENCE_LOCAL_ADDRESS}:$(frontend_port)"
+  telepresence_cmd intercept "$service" \
     --service "$service" \
     --port "$(frontend_port):3000" \
-    --address "$LOCAL_FRONTEND_HOST"
+    --address "$TELEPRESENCE_LOCAL_ADDRESS"
 }
 
 intercept_server_traffic() {
   telepresence_connect
   telepresence_leave_intercept "ppanel-server"
 
-  log "Intercepting backend service ${K8S_NAMESPACE}/ppanel-server to ${LOCAL_SERVER_HOST}:${LOCAL_SERVER_PORT}"
-  telepresence intercept "ppanel-server" \
+  log "Intercepting backend service ${K8S_NAMESPACE}/ppanel-server to ${TELEPRESENCE_LOCAL_ADDRESS}:${LOCAL_SERVER_PORT}"
+  telepresence_cmd intercept "ppanel-server" \
     --service "ppanel-server" \
     --port "${LOCAL_SERVER_PORT}:8080" \
-    --address "$LOCAL_SERVER_HOST"
+    --address "$TELEPRESENCE_LOCAL_ADDRESS"
 }
 
 frontend_dev_command() {
@@ -558,20 +641,42 @@ stop_conflicting_compose_server() {
 }
 
 ensure_server_process() {
+  local current_mysql_host current_mysql_port current_mysql_database
+  local current_mysql_user current_redis_host current_redis_port current_redis_password
+
   ensure_state_dir
   ensure_docker_network
 
-  if docker_container_running "$SERVER_CONTAINER"; then
-    log "Local server container is already running: $SERVER_CONTAINER"
-    return
-  fi
+  current_mysql_host="$(server_state_value mysql_host)"
+  current_mysql_port="$(server_state_value mysql_port)"
+  current_mysql_database="$(server_state_value mysql_database)"
+  current_mysql_user="$(server_state_value mysql_user)"
+  current_redis_host="$(server_state_value redis_host)"
+  current_redis_port="$(server_state_value redis_port)"
+  current_redis_password="$(server_state_value redis_password)"
 
-  stop_conflicting_compose_server
-  normalize_server_config
+  if docker_container_running "$SERVER_CONTAINER"; then
+    if [[ "$current_mysql_host" != "$(mysql_runtime_host)" ]] || \
+       [[ "$current_mysql_port" != "$(mysql_runtime_port)" ]] || \
+       [[ "$current_mysql_database" != "$MYSQL_DATABASE" ]] || \
+       [[ "$current_mysql_user" != "$SERVER_DB_USER" ]] || \
+       [[ "$current_redis_host" != "$(redis_runtime_host)" ]] || \
+       [[ "$current_redis_port" != "$(redis_runtime_port)" ]] || \
+       [[ "$current_redis_password" != "$REDIS_PASSWORD" ]]; then
+      log "Local server container config changed; recreating $SERVER_CONTAINER"
+      docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1 || true
+    else
+      log "Local server container is already running: $SERVER_CONTAINER"
+      return
+    fi
+  fi
 
   if docker_container_exists "$SERVER_CONTAINER"; then
     docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1 || true
   fi
+
+  stop_conflicting_compose_server
+  normalize_server_config
 
   log "Starting local ppanel-server container"
   docker run -d \
@@ -582,6 +687,8 @@ ensure_server_process() {
     -e PPANEL_DB="${SERVER_DB_USER}:${SERVER_DB_PASSWORD}@tcp($(mysql_runtime_host):$(mysql_runtime_port))/${MYSQL_DATABASE}?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai" \
     -e PPANEL_REDIS="$(redis_runtime_url)" \
     "$SERVER_IMAGE" >/dev/null
+
+  write_server_state
 
   if server_config_initialized; then
     if ! wait_for_http "${SERVER_URL}/v1/common/site/config" 90 1; then
@@ -594,6 +701,22 @@ ensure_server_process() {
   if ! wait_for_container_http "http://127.0.0.1:8080/init" 90 1; then
     docker logs --tail=120 "$SERVER_CONTAINER" >"$SERVER_LOG_FILE" 2>&1 || true
     die "Init server did not become ready inside container. See $SERVER_LOG_FILE"
+  fi
+}
+
+stop_frontend_listener() {
+  local port="$1"
+  local label="$2"
+  local pid command
+
+  pid="$(find_listener_pid "$port")"
+  [[ -n "$pid" ]] || return 0
+
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [[ "$command" == *"$FRONTEND_ROOT"* ]] && [[ "$command" == *"vite"* || "$command" == *"bun"* || "$command" == *"node"* ]]; then
+    log "Stopping $label on port ${port} (PID ${pid})"
+    stop_pid_if_running "$pid"
+    sleep 1
   fi
 }
 
@@ -791,22 +914,33 @@ ensure_server_backend() {
 
 start_frontend() {
   local api_base_url="${1:-}"
+  local current_app current_api_base_url pid
 
   ensure_frontend_tools
   ensure_state_dir
 
-  if [[ -z "$api_base_url" ]] && wait_for_http_status "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)" 5 1; then
+  current_app="$(frontend_state_value app)"
+  current_api_base_url="$(frontend_state_value api_base_url)"
+
+  if [[ "$current_app" == "$FRONTEND_APP" ]] && [[ "$current_api_base_url" == "$api_base_url" ]] && [[ -z "$api_base_url" ]] && wait_for_http_status "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)" 5 1; then
     log "Frontend is already reachable at http://${LOCAL_FRONTEND_HOST}:$(frontend_port); reusing existing dev server"
     return
   fi
 
-  local pid
   pid="$(read_pid "$FRONTEND_PID_FILE")"
   if is_pid_running "$pid"; then
-    log "Frontend dev server is already running with PID $pid"
-    return
+    if [[ "$current_app" == "$FRONTEND_APP" ]] && [[ "$current_api_base_url" == "$api_base_url" ]]; then
+      log "Frontend dev server is already running with PID $pid"
+      return
+    fi
+    log "Frontend config changed; restarting frontend dev server (PID $pid)"
+    stop_pid_if_running "$pid"
   fi
   rm -f "$FRONTEND_PID_FILE"
+  rm -f "$FRONTEND_STATE_FILE"
+
+  stop_frontend_listener "$LOCAL_USER_PORT" "stale frontend listener"
+  stop_frontend_listener "$LOCAL_ADMIN_PORT" "stale frontend listener"
 
   ensure_frontend_port_available "$(frontend_port)" "frontend"
   ensure_frontend_port_available "$(frontend_devtools_port)" "frontend devtools"
@@ -828,6 +962,8 @@ start_frontend() {
       "$(frontend_dir)" \
       /bin/sh -lc "$(frontend_dev_command)"
   fi
+
+  write_frontend_state "$api_base_url"
 
   if ! wait_for_http "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)" 90 1; then
     die "Frontend did not become ready. See $FRONTEND_LOG_FILE"
@@ -870,20 +1006,27 @@ leave_server() {
     log "Stopping local server container: $SERVER_CONTAINER"
     docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1 || true
   fi
+  rm -f "$SERVER_STATE_FILE"
 }
 
 leave_frontend() {
   telepresence_leave_intercept "ppanel-admin-web"
   telepresence_leave_intercept "ppanel-user-web"
   stop_pid_file "$FRONTEND_PID_FILE" "frontend dev server"
+  stop_frontend_listener "$LOCAL_USER_PORT" "frontend dev server"
+  stop_frontend_listener "$LOCAL_ADMIN_PORT" "frontend dev server"
+  rm -f "$FRONTEND_STATE_FILE"
 }
 
 status() {
   ensure_state_dir
 
-  local server_pid frontend_pid
+  local server_pid frontend_pid frontend_app frontend_port_value frontend_api_base_url
   server_pid="$(read_pid "$SERVER_PID_FILE")"
   frontend_pid="$(read_pid "$FRONTEND_PID_FILE")"
+  frontend_app="$(frontend_state_value app)"
+  frontend_port_value="$(frontend_state_value port)"
+  frontend_api_base_url="$(frontend_state_value api_base_url)"
 
   printf 'Server process:   %s\n' "$(docker_container_running "$SERVER_CONTAINER" && printf 'running (container %s)' "$SERVER_CONTAINER" || printf 'stopped')"
   printf 'Frontend process: %s\n' "$(is_pid_running "$frontend_pid" && printf 'running (pid %s)' "$frontend_pid" || printf 'stopped')"
@@ -892,14 +1035,17 @@ status() {
   printf 'K8s namespace:    %s\n' "$K8S_NAMESPACE"
   printf 'TP manager ns:    %s\n' "$TELEPRESENCE_MANAGER_NAMESPACE"
   printf 'Server URL:       %s\n' "$SERVER_URL"
-  printf 'Frontend URL:     %s\n' "http://${LOCAL_FRONTEND_HOST}:$(frontend_port)"
+  printf 'Frontend app:     %s\n' "${frontend_app:-unknown}"
+  printf 'Frontend URL:     %s\n' "http://${LOCAL_FRONTEND_HOST}:${frontend_port_value:-unknown}"
+  printf 'Frontend API URL: %s\n' "${frontend_api_base_url:-<default>}"
   printf 'Server log:       %s\n' "$SERVER_LOG_FILE"
   printf 'Frontend log:     %s\n' "$FRONTEND_LOG_FILE"
 
   if command -v telepresence >/dev/null 2>&1; then
+    telepresence_configure
     printf '\nTelepresence:\n'
-    telepresence status 2>&1 || true
-    telepresence list --intercepts 2>&1 || true
+    telepresence_cmd status 2>&1 || true
+    telepresence_cmd list --intercepts 2>&1 || true
   fi
 }
 
