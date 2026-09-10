@@ -22,36 +22,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/perfect-panel/ppanel-script/
 bash <(wget -qO- https://raw.githubusercontent.com/perfect-panel/ppanel-script/refs/heads/main/install.sh)
 ```
 
-## 本地 Telepresence 联调
+## 本地开发
 
-使用 [`telepresence.sh`](./telepresence.sh) 配合 Telepresence 风格的开发域名切换本地前端或本地后端。
-
-```sh
-VITE_ALLOWED_HOSTS=.home.arpa \
-VITE_DEVTOOLS_PORT=42170 \
-./telepresence.sh up frontend --frontend user
-```
-
-- `up frontend`：切到本地前端，后端继续使用 k3s 中的部署
-- `up server`：切到本地后端，依赖继续使用共享的 MySQL / Redis
-- `up both`：前后端都切到本地；依赖仍使用共享的 MySQL / Redis
-
-默认会通过 `host.docker.internal:13306` 和 `host.docker.internal:16379` 连接共享依赖。
-脚本会使用 Telepresence 连接 `ppanel-dev` 命名空间，并为前端或后端创建 intercept。
-
-如果要显式指定共享依赖，请直接通过命令行参数传入，而不是依赖环境变量，例如：
+`compose.yaml` 在本机拉起整套服务。这就是 `develop` 环境：全部跑在本地，
+不发布任何东西，也没有域名——通过 `localhost` 访问。
 
 ```sh
-./telepresence.sh up server \
-  --mysql-host host.docker.internal \
-  --mysql-port 13306 \
-  --mysql-database ppanel_dev \
-  --mysql-user root \
-  --mysql-password dev-root-password \
-  --redis-host host.docker.internal \
-  --redis-port 16379
+docker compose up -d
 ```
 
-如果集群里还没有安装 Telepresence `traffic-manager`，可以在首次执行时追加 `--install-traffic-manager`。
+| 服务 | 地址 |
+| --- | --- |
+| 后端 API | `http://localhost:8080` |
+| 管理端 | `http://localhost:3001` |
+| 用户端 | `http://localhost:3002` |
+| MySQL | `localhost:3306`，库 `ppanel`，数据在 `./db` |
+| Redis | `localhost:6379`，数据在 `./cache` |
 
-脚本默认假设 `ppanel-script`、`ppanel-frontend`、`ppanel-server` 是同级目录。
+后端配置在 `config/ppanel.yaml`。默认管理员是 `admin@ppanel.dev` / `password`，
+往任何能被别人访问的地方放之前先改掉。
+
+镜像从 Docker Hub 拉取，**不推送**。要验自己改的代码，本地 build 覆盖同一个 tag 即可，
+同样没有发布环节。
+
+`develop` 有自己独立的数据库，和 `test` 部署不共享任何东西。
