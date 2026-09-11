@@ -1,33 +1,23 @@
 services:
   ppanel-db:
-    image: mysql:8.4.5
+    # 【必须和 test 同一种数据库】上游的 pg 支持是靠方言分支实现的
+    # （db.Dialector.Name() 散布在各 repo），本机跑 MySQL 就复现不了 test 上
+    # 的方言问题——那正是本机栈存在的意义。
+    image: postgres:17.11-alpine
     container_name: ppanel-db
     restart: always
     networks:
       - ppanel-network
     ports:
-      - 3306:3306
+      - 5432:5432
     environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: ppanel
-      MYSQL_USER: ppanel
-      MYSQL_PASSWORD: ppanelpassword
+      POSTGRES_DB: ppanel
+      POSTGRES_USER: ppanel
+      POSTGRES_PASSWORD: ppanelpassword
     volumes:
-      - ./db:/var/lib/mysql
-    command:
-      - --mysql-native-password=on
-      - --bind-address=0.0.0.0
+      - ./db:/var/lib/postgresql/data
     healthcheck:
-      test:
-        [
-          "CMD",
-          "mysqladmin",
-          "ping",
-          "-h",
-          "localhost",
-          "-uroot",
-          "-prootpassword",
-        ]
+      test: ["CMD-SHELL", "pg_isready -U ppanel -d ppanel"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -36,7 +36,7 @@ docker compose up -d
 | 后端 API | `http://localhost:8080` |
 | 管理端 | `http://localhost:3001` |
 | 用户端 | `http://localhost:3002` |
-| MySQL | `localhost:3306`，库 `ppanel`，数据在 `./db` |
+| PostgreSQL | `localhost:5432`，库 `ppanel`，数据在 `./db` |
 | Redis | `localhost:6379`，数据在 `./cache` |
 
 后端配置在 `config/ppanel.yaml`。默认管理员是 `admin@ppanel.dev` / `password`，
@@ -46,3 +46,12 @@ docker compose up -d
 同样没有发布环节。
 
 `develop` 有自己独立的数据库，和 `test` 部署不共享任何东西。
+
+## 从 MySQL 版升上来
+
+`./db` 里是 MySQL 的数据目录，Postgres 拒绝往非空目录初始化，会起不来。
+本机数据没有保留价值，直接删掉重来：
+
+```sh
+docker compose down && rm -rf ./db && docker compose up -d
+```
