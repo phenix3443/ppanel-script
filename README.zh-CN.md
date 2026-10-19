@@ -2,25 +2,17 @@
 
 <img width="160" src="https://raw.githubusercontent.com/perfect-panel/ppanel-assets/refs/heads/main/logo.svg">
 
-<h1>PPanel 快速部署指南</h1>
+<h1>PPanel 开发环境</h1>
 
-这是由 PPanel 提供支持的快速部署脚本
+从源码构建本 fork 后端与前端的 Docker Compose 栈
 
 [英文](./README.md) · 中文
 
 </div>
 
-## 脚本部署
-
-运行以下命令来部署 PPanel：
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/perfect-panel/ppanel-script/refs/heads/main/install.sh)
-```
-
-```sh
-bash <(wget -qO- https://raw.githubusercontent.com/perfect-panel/ppanel-script/refs/heads/main/install.sh)
-```
+这个仓库**不是安装器**。上游的一键安装脚本 `install.sh` 已删除：它跑的就是这份
+`compose.yaml`，而这份 compose 要从相邻的源码仓库构建，在只有本仓库的服务器上跑不起来。
+要按上游方式安装，请用 [perfect-panel/ppanel-script](https://github.com/perfect-panel/ppanel-script)。
 
 ## 本地开发
 
