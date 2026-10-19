@@ -2,25 +2,18 @@
 
 <img width="160" src="https://raw.githubusercontent.com/perfect-panel/ppanel-assets/refs/heads/main/logo.svg">
 
-<h1>PPanel Quick Deployment Guide</h1>
+<h1>PPanel Develop Environment</h1>
 
-This is a quick deployment script provided by PPanel
+A Docker Compose stack that builds this fork's backend and frontend from source
 
 English · [中文](./README.zh-CN.md)
 
 </div>
 
-### Script Deployment
-
-Run the following commands to deploy PPanel:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/perfect-panel/ppanel-script/refs/heads/main/install.sh)
-```
-
-```bash
-bash <(wget -qO- https://raw.githubusercontent.com/perfect-panel/ppanel-script/refs/heads/main/install.sh)
-```
+This repository is **not an installer**. The upstream one-click `install.sh` was
+removed: it ran this `compose.yaml`, which builds from sibling source checkouts and
+so cannot work on a server that has only this repository. For a production-style
+install use upstream [perfect-panel/ppanel-script](https://github.com/perfect-panel/ppanel-script).
 
 ### Local Development
 
